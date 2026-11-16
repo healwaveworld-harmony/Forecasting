@@ -96,7 +96,7 @@ def load_source(file_bytes):
     wb.close()
     return records, issues, wb.sheetnames
 
-def build_forecast(rec, growth, horizon_years, start_month, manual_base=None, manual_monthly=None):
+def build_forecast(rec, growth, horizon_years, start_month, manual_base=None, manual_monthly=None, month_overrides=None):
     hist = rec["monthly"].copy()
     if not hist.empty:
         hist = hist[hist["month"] < start_month].sort_values("month")
@@ -137,6 +137,9 @@ def build_forecast(rec, growth, horizon_years, start_month, manual_base=None, ma
             season_factor = (raw / pattern_mean) if pattern_mean and np.isfinite(raw) else 1.0
             annual_growth_factor = (1 + growth/100) ** ((i//12)+1)
             qty = blended * season_factor * annual_growth_factor
+        # Optional reviewed monthly plans override the calculated quantity by calendar month.
+        if month_overrides and str(d.month) in month_overrides:
+            qty = max(0.0, float(month_overrides[str(d.month)]))
         rows.append({"Month":d,"Forecast Qty":int(max(0,round(qty)))})
     return {"avg12":0.0 if pd.isna(avg12) else avg12,
             "avg3":0.0 if pd.isna(avg3) else avg3,
@@ -197,7 +200,7 @@ def excel_export(source_bytes, products, params, start_month, years, client_orde
 
     for rec in products:
         p = params[rec["key"]]
-        result = build_forecast(rec, p["growth"], years, start_month, p.get("manual_base"), p.get("manual_monthly"))
+        result = build_forecast(rec, p["growth"], years, start_month, p.get("manual_base"), p.get("manual_monthly"), p.get("month_overrides"))
         assumption_rows.append([rec["plant"],rec["source_row"],rec.get("status"),rec.get("Customer"),
             rec.get("Model"),rec.get("Vehicle / Nameplate"),rec.get("Part No."),rec.get("SOP"),
             rec.get("SAP Code"),rec.get("Product"),rec.get("Segment"),rec.get("Material"),
@@ -416,6 +419,7 @@ for r in records:
     st.session_state.params[r["key"]].setdefault("manual_monthly",None)
     st.session_state.params[r["key"]].setdefault("price",(float(r["suggested_price"]) if pd.notna(r.get("suggested_price",np.nan)) else None))
     st.session_state.params[r["key"]].setdefault("price_confirmed",False)
+    st.session_state.params[r["key"]].setdefault("month_overrides",{})
 if "client_orders" not in st.session_state:
     st.session_state.client_orders=[]
 
@@ -449,6 +453,27 @@ with tabs[0]:
     if not visible:
         st.warning("No products match the current filters.")
     else:
+        # One-click confirmation controls for products in the current filters.
+        st.markdown("#### Select-all confirmations")
+        st.caption("Applies to all products currently visible under the plant, client and search filters.")
+        c_price, c_qty, c_clear = st.columns(3)
+        if c_price.button("✓ Select all — Price confirmed", key="confirm_all_prices"):
+            for rec in visible:
+                st.session_state.params[rec["key"]]["price_confirmed"] = True
+            st.session_state.pop("bulk_product_editor", None)
+            st.rerun()
+        if c_qty.button("✓ Select all — Demand confirmed", key="confirm_all_quantities"):
+            for rec in visible:
+                st.session_state.params[rec["key"]]["confirmed"] = True
+            st.session_state.pop("bulk_product_editor", None)
+            st.rerun()
+        if c_clear.button("Clear confirmations", key="clear_all_confirmations"):
+            for rec in visible:
+                st.session_state.params[rec["key"]]["price_confirmed"] = False
+                st.session_state.params[rec["key"]]["confirmed"] = False
+            st.session_state.pop("bulk_product_editor", None)
+            st.rerun()
+
         # Bulk growth update for all currently filtered products.
         st.markdown("#### Apply one growth change to all filtered products")
         b1,b2,b3=st.columns([2,1,1])
@@ -467,7 +492,7 @@ with tabs[0]:
         grid_rows=[]
         for rec in visible:
             p=st.session_state.params[rec["key"]]
-            pr=build_forecast(rec,p["growth"],horizon,start_month,p.get("manual_base"),p.get("manual_monthly"))
+            pr=build_forecast(rec,p["growth"],horizon,start_month,p.get("manual_base"),p.get("manual_monthly"),p.get("month_overrides"))
             grid_rows.append({"Key":rec["key"],"Plant":rec["plant"],"Customer":rec.get("Customer"),
                 "Product":rec.get("Product") or rec.get("Model"),"Part No.":rec.get("Part No."),
                  "Plan status":pr["plan_status"],"Plan Months":len(rec["monthly"]),
@@ -505,7 +530,7 @@ with tabs[0]:
         st.markdown("#### Manual month-wise plan and detailed product review")
         for rec in visible:
             p=st.session_state.params[rec["key"]]
-            preview=build_forecast(rec,p["growth"],horizon,start_month,p.get("manual_base"),p.get("manual_monthly"))
+            preview=build_forecast(rec,p["growth"],horizon,start_month,p.get("manual_base"),p.get("manual_monthly"),p.get("month_overrides"))
             label=product_label(rec)
             with st.expander(label,expanded=False):
                 st.caption(f'{preview["plan_status"]} · {preview["n12"]} trailing 12-month observations · {preview["n3"]} trailing 3-month observations')
@@ -637,7 +662,7 @@ with tabs[2]:
         p=st.session_state.params[rec["key"]]
         if not p["include"]: continue
         if not p["confirmed"]: unconfirmed.append(product_label(rec))
-        result=build_forecast(rec,p["growth"],horizon,start_month,p.get("manual_base"),p.get("manual_monthly"))
+        result=build_forecast(rec,p["growth"],horizon,start_month,p.get("manual_base"),p.get("manual_monthly"),p.get("month_overrides"))
         rows.append({"Plant":rec["plant"],"Customer":rec.get("Customer"),"Product":rec.get("Product"),
             "Part No.":rec.get("Part No."),"Growth %":p["growth"],"Last 12M Avg":result["avg12"],
              "Last 3M Avg":result["avg3"],"Blended Base":result["blended"],
@@ -685,7 +710,7 @@ with tabs[3]:
             plant_totals={}
             for r in included_for_ai:
                 pp=st.session_state.params[r["key"]]
-                ff=build_forecast(r,pp["growth"],horizon,start_month,pp.get("manual_base"),pp.get("manual_monthly"))["forecast"]
+                ff=build_forecast(r,pp["growth"],horizon,start_month,pp.get("manual_base"),pp.get("manual_monthly"),pp.get("month_overrides"))["forecast"]
                 total_qty += float(ff["Forecast Qty"].sum())
                 plant_totals[r["plant"]]=plant_totals.get(r["plant"],0.0)+float(ff["Forecast Qty"].sum())
             prompt=("Write a concise operations-planning commentary for a demand forecast. "
@@ -706,6 +731,109 @@ with tabs[3]:
     if st.session_state.get("ai_forecast_commentary"):
         st.markdown("#### AI planning commentary")
         st.write(st.session_state["ai_forecast_commentary"])
+    st.divider()
+    st.markdown("#### Final review — unusual monthly Plan variations")
+    st.caption("Before building the final workbook, choose a source year. Products with a sudden month-to-month change or a large difference from their yearly median are listed with all 12 months. Edit the proposed quantity and tick only the months you want to apply to the forecast.")
+    available_years = sorted({
+        int(pd.Timestamp(m).year)
+        for rec in included
+        for m in rec["monthly"].get("month", [])
+    })
+    if available_years:
+        vc1, vc2 = st.columns([1, 1])
+        review_year = vc1.selectbox(
+            "Source Plan year",
+            available_years,
+            index=len(available_years)-1,
+            key="final_variation_year"
+        )
+        variation_pct = vc2.slider(
+            "Flag sudden variation (%)",
+            min_value=5, max_value=80, value=20, step=5,
+            key="final_variation_threshold"
+        )
+        variation_rows = []
+        for rec in included:
+            hist = rec["monthly"]
+            if hist.empty:
+                continue
+            yh = hist[hist["month"].dt.year.eq(review_year)].copy()
+            if yh.empty:
+                continue
+            month_map = {int(x.month.month): float(x.quantity) for x in yh.itertuples()}
+            if len(month_map) < 3:
+                continue
+            observed = [v for v in month_map.values() if v > 0]
+            if len(observed) < 3:
+                continue
+            median_qty = float(np.median(observed))
+            median_flags = {
+                m for m, q in month_map.items()
+                if median_qty > 0 and abs(q - median_qty) / median_qty * 100 >= variation_pct
+            }
+            adjacent_flags = set()
+            ordered_months = sorted(month_map)
+            for previous_month, current_month in zip(ordered_months, ordered_months[1:]):
+                previous_qty = month_map[previous_month]
+                current_qty = month_map[current_month]
+                if previous_qty > 0 and abs(current_qty - previous_qty) / previous_qty * 100 >= variation_pct:
+                    adjacent_flags.update([previous_month, current_month])
+            flagged_months = median_flags | adjacent_flags
+            if not flagged_months:
+                continue
+            p = st.session_state.params[rec["key"]]
+            overrides = p.setdefault("month_overrides", {})
+            for month_no in range(1, 13):
+                if month_no not in month_map:
+                    continue
+                is_flagged = month_no in flagged_months
+                variation_rows.append({
+                    "Key": rec["key"],
+                    "Plant": rec["plant"],
+                    "Customer": rec.get("Customer"),
+                    "Product": rec.get("Product") or rec.get("Model"),
+                    "Part No.": rec.get("Part No."),
+                    "Month": pd.Timestamp(2000, month_no, 1).strftime("%b"),
+                    "Month No.": month_no,
+                    "Source Plan Qty": month_map[month_no],
+                    "Variation": "REVIEW" if is_flagged else "Normal",
+                    "Apply to forecast": str(month_no) in overrides,
+                    "Forecast Plan Qty": float(overrides.get(str(month_no), month_map[month_no]))
+                })
+        if variation_rows:
+            vdf = pd.DataFrame(variation_rows)
+            st.caption(f"{len(vdf[['Key']].drop_duplicates()):,} products flagged for review. All available months for those products are shown; normal months are included so you can retain the existing pattern.")
+            edited_variations = st.data_editor(
+                vdf,
+                use_container_width=True,
+                hide_index=True,
+                height=430,
+                disabled=["Key", "Plant", "Customer", "Product", "Part No.", "Month", "Month No.", "Source Plan Qty", "Variation"],
+                column_config={
+                    "Apply to forecast": st.column_config.CheckboxColumn("Apply to forecast"),
+                    "Forecast Plan Qty": st.column_config.NumberColumn("Forecast plan quantity", min_value=0, step=1, format="%d")
+                },
+                key="final_month_variation_editor"
+            )
+            if st.button("Save reviewed monthly plans", key="save_final_month_variations"):
+                for _, row in edited_variations.iterrows():
+                    product_key = row["Key"]
+                    month_key = str(int(row["Month No."]))
+                    if product_key not in st.session_state.params:
+                        continue
+                    month_overrides = st.session_state.params[product_key].setdefault("month_overrides", {})
+                    if bool(row["Apply to forecast"]):
+                        month_overrides[month_key] = float(row["Forecast Plan Qty"])
+                    else:
+                        month_overrides.pop(month_key, None)
+                st.session_state.pop("final_month_variation_editor", None)
+                st.success("Reviewed monthly plans saved. Selected month quantities will override the calculated forecast for the same calendar months.")
+                st.rerun()
+        else:
+            st.success("No products meet the selected variation threshold for this source year.")
+    else:
+        st.info("No dated monthly Plan values are available for the included products.")
+
     if st.button("Build Excel forecast workbook",type="primary"):
         export_params={r["key"]:st.session_state.params[r["key"]] for r in records}
         data=excel_export(file_bytes,records,export_params,start_month,horizon,st.session_state.client_orders,source_name,sheet_names)
