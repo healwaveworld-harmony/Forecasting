@@ -140,6 +140,9 @@ def build_forecast(rec, growth, horizon_years, start_month, manual_base=None, ma
         # Optional reviewed monthly plans override the calculated quantity by calendar month.
         if month_overrides and str(d.month) in month_overrides:
             qty = max(0.0, float(month_overrides[str(d.month)]))
+        # Exact forecast-month overrides (YYYY-MM) from editable Tab 3 review.
+        if month_overrides and d.strftime("%Y-%m") in month_overrides:
+            qty = max(0.0, float(month_overrides[d.strftime("%Y-%m")]))
         rows.append({"Month":d,"Forecast Qty":int(max(0,round(qty)))})
     return {"avg12":0.0 if pd.isna(avg12) else avg12,
             "avg3":0.0 if pd.isna(avg3) else avg3,
@@ -641,6 +644,7 @@ with tabs[2]:
             "Price Confirmed":"Yes" if p.get("price_confirmed") else "Pending",
             "Confirmed":"Yes" if p["confirmed"] else "Pending"})
         f=result["forecast"].copy()
+        f["_Product Key"]=rec["key"]
         f["Plant"]=rec["plant"]; f["Customer"]=rec.get("Customer"); f["Product"]=rec.get("Product")
         f["Part No."]=rec.get("Part No.")
         pprice=float(p.get("price") or 0)
@@ -655,7 +659,7 @@ with tabs[2]:
         st.dataframe(summary,use_container_width=True,hide_index=True)
         allf=pd.concat(forecasts,ignore_index=True)
         st.markdown("#### Month-wise forecast")
-        st.caption("All included products are shown by default. Use the part selector to isolate one or more part numbers for checking; clear the selection to return to all parts.")
+        st.caption("Calculated quantities are prefilled for every part and month. Edit only the quantities that need correction, then save the changes to use them in the forecast and Excel export.")
         part_choices = sorted({
             f"{str(row.get('Part No.') or 'No part number')} — {str(row.get('Product') or '')}"
             for _, row in allf[["Part No.", "Product"]].drop_duplicates().iterrows()
@@ -671,10 +675,42 @@ with tabs[2]:
         if selected_parts:
             selected_part_numbers = {item.split(" — ", 1)[0] for item in selected_parts}
             month_view = month_view[month_view["Part No."].fillna("No part number").astype(str).isin(selected_part_numbers)]
-        month_view = month_view.assign(Month=month_view.Month.dt.strftime("%b %Y"))
-        st.dataframe(month_view[
-            ["Plant","Customer","Product","Part No.","Month","Forecast Qty","Unit Price INR","Forecast Value INR","Forecast Value INR Mn"]],
-            use_container_width=True,hide_index=True,height=480)
+        month_view["_Month Key"] = month_view["Month"].dt.strftime("%Y-%m")
+        month_view["Month"] = month_view["Month"].dt.strftime("%b %Y")
+        editor_cols = ["_Product Key","Plant","Customer","Product","Part No.","_Month Key","Month","Forecast Qty","Unit Price INR","Forecast Value INR","Forecast Value INR Mn"]
+        editable_view = month_view[editor_cols].copy()
+        edited_months = st.data_editor(
+            editable_view,
+            use_container_width=True,
+            hide_index=True,
+            height=520,
+            disabled=["_Product Key","Plant","Customer","Product","Part No.","_Month Key","Month","Unit Price INR","Forecast Value INR","Forecast Value INR Mn"],
+            column_config={
+                "_Product Key": None,
+                "_Month Key": None,
+                "Forecast Qty": st.column_config.NumberColumn("Forecast Qty (editable)", min_value=0, step=1, format="%d", help="Calculated value is prefilled. Change only if you want to override this part and month.")
+            },
+            key="forecast_review_month_editor"
+        )
+        if st.button("Save monthly quantity edits", type="primary", key="save_forecast_month_edits"):
+            saved_count = 0
+            for _, row in edited_months.iterrows():
+                product_key = row["_Product Key"]
+                month_key = str(row["_Month Key"])
+                if product_key not in st.session_state.params:
+                    continue
+                overrides = st.session_state.params[product_key].setdefault("month_overrides", {})
+                original_row = allf[(allf["_Product Key"] == product_key) & (allf["Month"].dt.strftime("%Y-%m") == month_key)]
+                original_qty = float(original_row.iloc[0]["Forecast Qty"]) if not original_row.empty else None
+                edited_qty = max(0.0, float(row["Forecast Qty"]))
+                if original_qty is not None and abs(edited_qty - original_qty) < 1e-9:
+                    overrides.pop(month_key, None)
+                else:
+                    overrides[month_key] = edited_qty
+                saved_count += 1
+            st.session_state.pop("forecast_review_month_editor", None)
+            st.success(f"Saved monthly quantities for {saved_count:,} displayed rows. Edited values will flow into the forecast and Excel export.")
+            st.rerun()
         st.metric("Total forecast quantity (current part selection)",f'{month_view["Forecast Qty"].sum():,.2f}')
     else:
         st.info("No products are currently included.")
