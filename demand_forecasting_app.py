@@ -527,67 +527,35 @@ with tabs[0]:
             st.rerun()
 
         st.divider()
-        st.markdown("#### Manual month-wise plan and detailed product review")
+        st.markdown("#### Monthly demand profile — history, mean and forecast")
+        st.caption("Demand confirmation and unit-price confirmation are managed in the table above. This section shows the prior two calendar years beside the forecast; only unusual forecast variations are opened for editing in the final review below.")
         for rec in visible:
             p=st.session_state.params[rec["key"]]
             preview=build_forecast(rec,p["growth"],horizon,start_month,p.get("manual_base"),p.get("manual_monthly"),p.get("month_overrides"))
-            label=product_label(rec)
-            with st.expander(label,expanded=False):
-                st.caption(f'{preview["plan_status"]} · {preview["n12"]} trailing 12-month observations · {preview["n3"]} trailing 3-month observations')
-                if rec["monthly"].empty or preview["nonzero_count"]==0:
-                    st.warning("No non-zero monthly Plan quantities were found before the forecast start date. Enter a manual monthly plan or a manual monthly base below. A blank is not converted into a demand quantity.")
-                price_context=pd.DataFrame([{
-                    "BP Sales Price (₹)":rec.get("Sales Price BP INR"),
-                    "Latest PO Price (₹)":rec.get("Latest PO Price INR"),
-                    "Budget Price (₹)":rec.get("Budget Price INR"),
-                    "FY25 Business Value (₹ Mn)":rec.get("FY25 Business Value INR Mn"),
-                    "FY26 Business Value (₹ Mn)":rec.get("FY26 Business Value INR Mn"),
-                    "FY27 Business Value (₹ Mn)":rec.get("FY27 Business Value INR Mn"),
-                    "FY28 Business Value (₹ Mn)":rec.get("FY28 Business Value INR Mn"),
-                    "FY29 Business Value (₹ Mn)":rec.get("FY29 Business Value INR Mn")}])
-                st.markdown("**Source pricing and business-value context**")
-                st.dataframe(price_context,use_container_width=True,hide_index=True)
-                st.markdown("**Source monthly Plan values (AJ:CQ)**")
-                src=rec["monthly"].copy()
-                if not src.empty:
-                    st.dataframe(src.assign(Month=src["month"].dt.strftime("%b %Y"))[["Month","quantity"]].rename(columns={"quantity":"Plan Qty"}),
-                                 use_container_width=True,hide_index=True,height=220)
+            with st.expander(product_label(rec),expanded=False):
+                st.caption(f'{preview["plan_status"]} · trailing 12-month mean: {preview["avg12"]:,.1f} · trailing 3-month mean: {preview["avg3"]:,.1f} · blended mean: {preview["blended"]:,.1f}')
+                hist=rec["monthly"].copy()
+                if not hist.empty:
+                    hist=hist[hist["month"] < start_month].copy()
+                    hist["Year"]=hist["month"].dt.year
+                    hist["Month"]=hist["month"].dt.month
+                    historical_years=sorted(hist["Year"].dropna().unique().tolist())
+                    years_to_show=historical_years[-2:]
+                    pivot=hist[hist["Year"].isin(years_to_show)].pivot_table(index="Month",columns="Year",values="quantity",aggfunc="mean")
+                    for yr in years_to_show:
+                        if yr not in pivot.columns: pivot[yr]=np.nan
+                    pivot=pivot.reindex(range(1,13))
+                    pivot.index=[pd.Timestamp(2000,m,1).strftime("%b") for m in pivot.index]
+                    pivot["Historical mean"] = pivot[years_to_show].mean(axis=1,skipna=True)
+                    pivot=pivot.rename(columns={yr:f"{yr} Plan Qty" for yr in years_to_show}).reset_index(names="Month")
+                    st.markdown("**Previous two years — monthly Plan quantities and mean**")
+                    st.dataframe(pivot,use_container_width=True,hide_index=True)
                 else:
-                    st.info("No numeric monthly Plan values were present for this product.")
-                with st.form(f'manual_plan_{rec["key"]}'):
-                    m1,m2=st.columns(2)
-                    manual_base=m1.number_input("Override blended monthly base (optional)",min_value=0.0,
-                        value=float(p["manual_base"] or 0.0),step=1.0,key=f'mbase_{rec["key"]}')
-                    price=m2.number_input("Confirmed unit selling price (₹)",min_value=0.0,
-                        value=float(p["price"] or 0.0),step=0.01,key=f'price_{rec["key"]}')
-                    monthly_text=st.text_area("Manual monthly plan quantities (comma-separated, in forecast month order)",
-                        value=",".join(str(x) for x in p.get("manual_monthly", [])) if isinstance(p.get("manual_monthly"), list) else (p.get("manual_monthly") or ""),height=90,
-                        placeholder="Example: 1200, 1250, 1300, 1300 ... enter 12 or 24 values as needed",
-                        key=f'mplan_{rec["key"]}')
-                    demand_confirm=st.checkbox("I confirm the demand assumptions",value=bool(p["confirmed"]),key=f'dconfirm_{rec["key"]}')
-                    price_confirm=st.checkbox("I confirm this unit price",value=bool(p.get("price_confirmed",False)),key=f'pconfirm_{rec["key"]}')
-                    save_detail=st.form_submit_button("Save detailed plan and price")
-                    if save_detail:
-                        vals=None
-                        if monthly_text.strip():
-                            try:
-                                vals=[float(x.strip()) for x in re.split(r"[,;\n]+",monthly_text) if x.strip()]
-                                if len(vals) not in [12,24]:
-                                    st.error("Enter exactly 12 or 24 monthly quantities, separated by commas.")
-                                    vals=None
-                            except Exception:
-                                st.error("Monthly plan must contain numeric quantities separated by commas.")
-                                vals=None
-                        if not monthly_text.strip() or vals is not None:
-                            p["manual_base"]=manual_base if manual_base>0 else None
-                            p["manual_monthly"]=vals
-                            p["price"]=price if price>0 else None
-                            p["confirmed"]=demand_confirm
-                            p["price_confirmed"]=price_confirm
-                            st.success("Detailed product plan and price saved.")
-                st.markdown(f"**Forecast preview — {12*horizon} months**")
-                st.dataframe(preview["forecast"].assign(Month=lambda x:x.Month.dt.strftime("%b %Y")),
-                             use_container_width=True,hide_index=True,height=360)
+                    st.info("No dated monthly Plan values are available for this product.")
+                forecast_view=preview["forecast"].copy()
+                forecast_view["Month"]=forecast_view["Month"].dt.strftime("%b %Y")
+                st.markdown("**Forecast months — quantities calculated from the confirmed assumptions above**")
+                st.dataframe(forecast_view,use_container_width=True,hide_index=True,height=300)
 
 with tabs[1]:
     st.subheader("Client & order register")
@@ -687,10 +655,27 @@ with tabs[2]:
         st.dataframe(summary,use_container_width=True,hide_index=True)
         allf=pd.concat(forecasts,ignore_index=True)
         st.markdown("#### Month-wise forecast")
-        st.dataframe(allf.assign(Month=allf.Month.dt.strftime("%b %Y"))[
+        st.caption("All included products are shown by default. Use the part selector to isolate one or more part numbers for checking; clear the selection to return to all parts.")
+        part_choices = sorted({
+            f"{str(row.get('Part No.') or 'No part number')} — {str(row.get('Product') or '')}"
+            for _, row in allf[["Part No.", "Product"]].drop_duplicates().iterrows()
+        })
+        selected_parts = st.multiselect(
+            "Select part number(s) to review",
+            options=part_choices,
+            default=[],
+            key="forecast_review_part_filter",
+            placeholder="All parts (no filter)"
+        )
+        month_view = allf.copy()
+        if selected_parts:
+            selected_part_numbers = {item.split(" — ", 1)[0] for item in selected_parts}
+            month_view = month_view[month_view["Part No."].fillna("No part number").astype(str).isin(selected_part_numbers)]
+        month_view = month_view.assign(Month=month_view.Month.dt.strftime("%b %Y"))
+        st.dataframe(month_view[
             ["Plant","Customer","Product","Part No.","Month","Forecast Qty","Unit Price INR","Forecast Value INR","Forecast Value INR Mn"]],
             use_container_width=True,hide_index=True,height=480)
-        st.metric("Total forecast quantity",f'{allf["Forecast Qty"].sum():,.2f}')
+        st.metric("Total forecast quantity (current part selection)",f'{month_view["Forecast Qty"].sum():,.2f}')
     else:
         st.info("No products are currently included.")
 
@@ -744,7 +729,7 @@ with tabs[3]:
         review_year = vc1.selectbox(
             "Source Plan year",
             available_years,
-            index=len(available_years)-1,
+            index=(available_years.index(2027) if 2027 in available_years else len(available_years)-1),
             key="final_variation_year"
         )
         variation_pct = vc2.slider(
@@ -783,10 +768,10 @@ with tabs[3]:
                 continue
             p = st.session_state.params[rec["key"]]
             overrides = p.setdefault("month_overrides", {})
-            for month_no in range(1, 13):
+            for month_no in sorted(flagged_months):
                 if month_no not in month_map:
                     continue
-                is_flagged = month_no in flagged_months
+                is_flagged = True
                 variation_rows.append({
                     "Key": rec["key"],
                     "Plant": rec["plant"],
@@ -802,7 +787,7 @@ with tabs[3]:
                 })
         if variation_rows:
             vdf = pd.DataFrame(variation_rows)
-            st.caption(f"{len(vdf[['Key']].drop_duplicates()):,} products flagged for review. All available months for those products are shown; normal months are included so you can retain the existing pattern.")
+            st.caption(f"{len(vdf[['Key']].drop_duplicates()):,} products flagged. Only unusual months are shown; ordinary months remain on the calculated forecast.")
             edited_variations = st.data_editor(
                 vdf,
                 use_container_width=True,
