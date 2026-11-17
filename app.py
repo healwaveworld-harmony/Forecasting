@@ -13,7 +13,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 from openpyxl.utils import get_column_letter
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.2.0"
 MONTH_START_COL = 36   # AJ
 MONTH_END_COL = 95     # CQ, inclusive
 MONTH_HEADER_ROW = 6
@@ -42,6 +42,46 @@ METHODS = [
     "Ensemble",
     "Existing Plan (NPI)",
 ]
+
+MODEL_DESCRIPTIONS = {
+    "Seasonal Naive": ("Repeats the quantity from the same month in the latest available year.",
+                       "Useful when the same seasonal pattern is expected to repeat; needs at least 12 months for a full seasonal cycle."),
+    "ETS / Holt-Winters": ("Exponential smoothing that learns the recent level, trend and (when enough data exists) monthly seasonality.",
+                           "Recent observations receive more weight, so it adapts as demand changes."),
+    "ARIMA": ("AutoRegressive Integrated Moving Average; models relationships between past values and changes over time.",
+              "Useful for time-series patterns with autocorrelation; this implementation uses a fixed (1,1,1) specification."),
+    "Ridge": ("Linear regression with regularisation, using recent demand lags and month-of-year signals.",
+              "Regularisation limits unstable coefficients when predictors are related; requires sufficient history."),
+    "Random Forest": ("A collection of decision trees that learns non-linear relationships from lagged demand and month-of-year features.",
+                      "Can capture more complex patterns but may be less reliable with short histories."),
+    "Croston SBA": ("Syntetos–Boylan Approximation for intermittent demand; estimates demand size and the interval between non-zero orders.",
+                    "Designed for parts with many zero-demand months; produces a smoothed average demand rate."),
+    "Moving Average": ("Uses the average of the latest three observed months as a constant monthly forecast.",
+                       "A simple, fast benchmark when trend or seasonality is weak or history is limited."),
+    "Ensemble": ("Averages forecasts from the available selected statistical methods.",
+                 "Reduces dependence on one model; methods that fail for a part are skipped."),
+    "Existing Plan (NPI)": ("Carries forward the uploaded plan for the target months when part history is insufficient or the part is new.",
+                            "This is a plan fallback, not a model-derived estimate of actual demand."),
+}
+METRIC_DESCRIPTIONS = {
+    "WAPE %": ("Weighted Absolute Percentage Error", "Total absolute forecast error divided by total actual/baseline volume. Lower is better; meaningful when the comparison total is above zero."),
+    "RMSE": ("Root Mean Squared Error", "Square root of the average squared error, in the same units as quantity. Lower is better; large misses receive extra weight."),
+    "Bias %": ("Forecast Bias", "Net over-forecast or under-forecast as a percentage of total comparison volume. Positive means over-forecast; negative means under-forecast."),
+    "Forecast Bias %": ("Forecast Bias", "Net over-forecast or under-forecast as a percentage of total comparison volume. Positive means over-forecast; negative means under-forecast."),
+    "NPI": ("New Product Introduction", "A new part or part with too little usable demand history for a reliable model fit."),
+    "ETS": ("Exponential Smoothing", "A family of methods that weights recent observations more heavily and can model level, trend and seasonality."),
+    "ARIMA": ("AutoRegressive Integrated Moving Average", "A statistical time-series model using lagged values and differenced data."),
+    "SBA": ("Syntetos–Boylan Approximation", "A bias-adjusted Croston method for intermittent demand."),
+}
+DEMAND_PATTERN_DESCRIPTIONS = {
+    "Seasonal": "Demand varies in a repeating month-of-year pattern.",
+    "Growing": "Recent history shows an upward trend relative to its average.",
+    "Declining": "Recent history shows a downward trend relative to its average.",
+    "Sparse": "Demand is intermittent, with many zero or very few non-zero months.",
+    "New NPI / Limited history": "Too few observations are available for a confident pattern classification.",
+    "New NPI / No history": "No usable part-level monthly history was found.",
+    "Stable": "No strong upward, downward or seasonal pattern was detected.",
+}
 
 st.set_page_config(page_title="Harmony Manufacturing Forecast Engine", page_icon="🏭", layout="wide")
 
@@ -275,7 +315,7 @@ def ml_forecast(y, h, method):
     if method == "Ridge":
         model = Ridge(alpha=2.0)
     else:
-        model = RandomForestRegressor(n_estimators=100, max_depth=5, min_samples_leaf=2, random_state=17, n_jobs=1)
+        model = RandomForestRegressor(n_estimators=60, max_depth=5, min_samples_leaf=2, random_state=17, n_jobs=1)
     model.fit(X, np.asarray(target, dtype=float))
     hist = list(arr.astype(float))
     preds = []
@@ -542,7 +582,26 @@ def assumptions_to_rows(assumptions, target_fys):
             })
     return pd.DataFrame(rows)
 
-def build_output_workbook(raw_bytes, filename, target_fys, records, month_map, cache, edited, candidates, global_method, assumptions):
+def build_glossary_df():
+    rows = []
+    for method, (meaning, use) in MODEL_DESCRIPTIONS.items():
+        rows.append({"Category":"Forecast model", "Term":method, "Meaning / full name":meaning, "How to interpret / use":use})
+    for term, (full, meaning) in METRIC_DESCRIPTIONS.items():
+        rows.append({"Category":"Metric / technical term", "Term":term, "Meaning / full name":full, "How to interpret / use":meaning})
+    for term, meaning in DEMAND_PATTERN_DESCRIPTIONS.items():
+        rows.append({"Category":"Demand pattern", "Term":term, "Meaning / full name":term, "How to interpret / use":meaning})
+    rows.extend([
+        {"Category":"Forecast terminology","Term":"Part Change %","Meaning / full name":"User-entered part-level adjustment","How to interpret / use":"A percentage applied to every forecast month for that part and forecast year."},
+        {"Category":"Forecast terminology","Term":"External Variables Effect %","Meaning / full name":"Combined business-assumption adjustment","How to interpret / use":"Compounded impact of enabled market, working-day, order, holiday, shutdown and campaign assumptions."},
+        {"Category":"Forecast terminology","Term":"Base Forecast Qty","Meaning / full name":"Model output before manual adjustments","How to interpret / use":"Forecast quantity before part-level percentage and external-variable adjustments."},
+        {"Category":"Forecast terminology","Term":"Adjusted Forecast Qty","Meaning / full name":"Final monthly forecast quantity","How to interpret / use":"Base forecast multiplied by the part change and applicable external-variable factors."},
+        {"Category":"Validation","Term":"Chronological holdout","Meaning / full name":"Time-ordered backtest","How to interpret / use":"The latest months are held out; earlier months train the model. It is not a random split."},
+        {"Category":"Validation","Term":"Plan baseline","Meaning / full name":"Uploaded monthly plan values","How to interpret / use":"Where the source workbook labels monthly values as Plan, the comparison is plan-baseline validation, not actual-demand accuracy."},
+    ])
+    return pd.DataFrame(rows)
+
+
+def build_output_workbook(raw_bytes, filename, target_fys, records, month_map, cache, edited, candidates, global_method, assumptions, selected_part_key=None):
     keep_vba = filename.lower().endswith(".xlsm")
     wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=False, keep_vba=keep_vba)
     # Data-only workbook supplies cached formula results for calculations.
@@ -669,6 +728,114 @@ def build_output_workbook(raw_bytes, filename, target_fys, records, month_map, c
     add_table_sheet(wb, "Forecast Summary", summary_df)
     add_table_sheet(wb, "Model Comparison", comparison_df)
 
+    # Consolidated comparison: one row per part, historical months plus the selected 24 forecast months.
+    target_months_all = sorted({dt for rec in records for fy in target_fys
+                                for dt in (cache.get((rec["key"], fy), {}).get("target_months", []))})
+    first_target_month = min(target_months_all) if target_months_all else None
+    historical_months = sorted({dt for rec in records for dt in rec["series"].keys()
+                                if first_target_month is not None and dt < first_target_month})
+    forecast_months = sorted(set(target_months_all))
+    part_rows = []
+    for rec in records:
+        row_edit = edited_by_key.get(rec["key"])
+        selected_method = str(row_edit["Selected Method"]) if row_edit is not None else cache[(rec["key"], target_fys[0])]["default_method"]
+        part_row = {
+            "Plant":rec["plant"], "Customer":rec["customer"], "Model":rec["model"], "Vehicle":rec["vehicle"],
+            "Part No.":rec["part_no"], "SAP Code":rec["sap_code"], "Product":rec["product"],
+            "Segment":rec["segment"], "Material":rec["material"], "Specification":rec["specification"],
+            "Weight kg/pc":rec["weight_kg"], "Price INR/pc":rec["price_inr_pc"],
+            "Source Data Basis":"Uploaded monthly plan / historical baseline; not actual demand",
+        }
+        for dt in historical_months:
+            val = rec["series"].get(dt, np.nan)
+            part_row[dt.strftime("%b-%y")] = float(val) if np.isfinite(val) else None
+        variable_labels = []
+        applied_models = []
+        for yi, fy in enumerate(target_fys):
+            info = cache.get((rec["key"], fy))
+            if info is None:
+                continue
+            pred, method_applied = ensure_forecast(info, selected_method, candidates)
+            change = float(row_edit["FY1 Change %"] if yi == 0 else row_edit["FY2 Change %"]) if row_edit is not None else 0.0
+            for dt, qty in zip(info["target_months"], forecast_values.get((rec["key"], fy), pred)):
+                part_row[dt.strftime("%b-%y")] = float(qty)
+            if method_applied not in applied_models:
+                applied_models.append(method_applied)
+            cfg = assumptions.get(fy, {})
+            for key, title, desc, scope in VARIABLE_DEFINITIONS:
+                if cfg.get(key + "_enabled") and abs(float(cfg.get(key + "_pct", 0.0) or 0.0)) > 1e-12:
+                    months = cfg.get(key + "_months", MONTH_NAMES) if scope == "months" else MONTH_NAMES
+                    month_text = f" ({','.join(months)})" if scope == "months" else ""
+                    variable_labels.append(f"{fy} {title}: {float(cfg.get(key + '_pct',0.0)):+g}%{month_text}")
+            if abs(change) > 1e-12:
+                variable_labels.append(f"{fy} Part change: {change:+g}%")
+        # Keep these as the final columns as requested.
+        part_row["Variables Applied"] = "; ".join(dict.fromkeys(variable_labels)) if variable_labels else "None"
+        part_row["Model Used"] = " / ".join(applied_models) if applied_models else selected_method
+        part_rows.append(part_row)
+    partwise_df = pd.DataFrame(part_rows)
+    partwise_ws = add_table_sheet(wb, "Part-wise Monthly Forecast", partwise_df)
+    partwise_ws.freeze_panes = "M2"
+    for col_idx, col_name in enumerate(partwise_df.columns, start=1):
+        if col_name in {dt.strftime("%b-%y") for dt in historical_months + forecast_months}:
+            partwise_ws.column_dimensions[get_column_letter(col_idx)].width = 12
+            for cells in partwise_ws.iter_cols(min_col=col_idx, max_col=col_idx, min_row=2):
+                for cell in cells:
+                    cell.number_format = '#,##0.00'
+    partwise_ws.auto_filter.ref = partwise_ws.dimensions
+
+    # One selected-part visual in Excel; the same selection is graphed in the app.
+    selected_rec = next((r for r in records if r["key"] == selected_part_key), None)
+    if selected_rec is None and records:
+        selected_rec = records[0]
+    if selected_rec is not None:
+        chart_ws = wb["Selected Part Trend"] if "Selected Part Trend" in wb.sheetnames else wb.create_sheet("Selected Part Trend")
+        chart_ws.delete_rows(1, chart_ws.max_row)
+        chart_ws.sheet_view.showGridLines = False
+        chart_ws.append(["Month", "Series", "Quantity"])
+        selected_info = []
+        for dt in historical_months:
+            val = selected_rec["series"].get(dt, np.nan)
+            if np.isfinite(val):
+                selected_info.append((dt, "Historical", float(val)))
+        for fy in target_fys:
+            info = cache.get((selected_rec["key"], fy))
+            if info:
+                yi = target_fys.index(fy)
+                row_edit = edited_by_key.get(selected_rec["key"])
+                method = str(row_edit["Selected Method"]) if row_edit is not None else info["default_method"]
+                pred, _ = ensure_forecast(info, method, candidates)
+                change = float(row_edit["FY1 Change %"] if yi == 0 else row_edit["FY2 Change %"]) if row_edit is not None else 0.0
+                factors = [variable_multiplier(fy, dt, assumptions) for dt in info["target_months"]]
+                adjusted = np.maximum(0, np.asarray(pred) * (1 + change/100.0) * np.asarray(factors))
+                selected_info.extend((dt, "Forecast", float(qty)) for dt, qty in zip(info["target_months"], adjusted))
+        for dt, series_type, qty in sorted(selected_info, key=lambda x: x[0]):
+            chart_ws.append([dt.to_pydatetime(), series_type, qty])
+        for cell in chart_ws[1]:
+            cell.fill = PatternFill("solid", fgColor="176B87")
+            cell.font = Font(bold=True, color="FFFFFF")
+        chart_ws.column_dimensions["A"].width = 16
+        chart_ws.column_dimensions["B"].width = 16
+        chart_ws.column_dimensions["C"].width = 18
+        chart_ws.freeze_panes = "A2"
+        from openpyxl.chart import LineChart, Reference
+        line = LineChart()
+        line.title = f"Monthly demand — {selected_rec['part_no']}"
+        line.y_axis.title = "Quantity"
+        line.x_axis.title = "Month"
+        line.style = 13
+        line.height = 9
+        line.width = 20
+        data_ref = Reference(chart_ws, min_col=3, min_row=1, max_row=chart_ws.max_row)
+        cats_ref = Reference(chart_ws, min_col=1, min_row=2, max_row=chart_ws.max_row)
+        line.add_data(data_ref, titles_from_data=True)
+        line.set_categories(cats_ref)
+        chart_ws.add_chart(line, "E2")
+        chart_ws["E20"] = f"Part: {selected_rec['part_no']} | Plant: {selected_rec['plant']}"
+        chart_ws["E21"] = "Historical values are from the uploaded workbook; forecast values include part changes and enabled external variables."
+
+    add_table_sheet(wb, "Forecast Glossary", build_glossary_df())
+
     controls = [
         ("Application Version", APP_VERSION),
         ("Source Workbook", filename),
@@ -692,6 +859,10 @@ def build_output_workbook(raw_bytes, filename, target_fys, records, month_map, c
         wb.calculation.calcMode = "auto"
     except Exception:
         pass
+    # Put the consolidated part-wise monthly sheet at the end for quick access.
+    if "Part-wise Monthly Forecast" in wb.sheetnames:
+        wb._sheets.remove(wb["Part-wise Monthly Forecast"])
+        wb._sheets.append(wb["Part-wise Monthly Forecast"])
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
@@ -745,6 +916,12 @@ def main():
         fy2 = st.selectbox("Forecast Year 2", year2_options, index=year2_options.index(def2), key="fy2")
     with c3:
         global_method = st.selectbox("Forecast method selection", ["Auto - Best Backtest"] + METHODS, index=0, help="Auto selects the best candidate by chronological holdout WAPE for each part. You can override the selected method part-by-part below.")
+    if global_method == "Auto - Best Backtest":
+        st.info("**Auto - Best Backtest** — Tests the eligible candidate methods on the latest chronological holdout months for each part, then selects the best validated method. Sparse-demand parts are prioritised for Croston SBA when available.")
+    else:
+        st.info(f"**{global_method}** — {MODEL_DESCRIPTIONS[global_method][0]} {MODEL_DESCRIPTIONS[global_method][1]}")
+    with st.expander("All forecast model names and meanings", expanded=True):
+        st.dataframe(pd.DataFrame([{"Model":m, "What it does":MODEL_DESCRIPTIONS[m][0], "When it is useful":MODEL_DESCRIPTIONS[m][1]} for m in METHODS]), use_container_width=True, hide_index=True)
     candidates = st.multiselect("Methods to compare in automatic selection", METHODS, default=["Seasonal Naive","ETS / Holt-Winters","Croston SBA"], help="These methods are compared on the latest available holdout months before each forecast year.")
     if not candidates:
         st.warning("Select at least one method for automatic comparison.")
@@ -827,7 +1004,8 @@ def main():
         hide_index=True,
         num_rows="fixed",
         column_config={
-            "Selected Method":st.column_config.SelectboxColumn("Selected Method",options=METHODS,required=True),
+            "Selected Method":st.column_config.SelectboxColumn("Selected Method",options=METHODS,required=True,
+                help="Choose the forecasting approach for this part. Full model meanings are shown above in the model guide."),
             "FY1 Change %":st.column_config.NumberColumn(f"{fy1} Change %",min_value=-100.0,max_value=500.0,step=1.0,format="%.1f"),
             "FY2 Change %":st.column_config.NumberColumn(f"{fy2} Change %",min_value=-100.0,max_value=500.0,step=1.0,format="%.1f"),
             "Last Month Qty":st.column_config.NumberColumn(format="%.2f",disabled=True),
@@ -898,6 +1076,29 @@ def main():
     monthly_df = pd.DataFrame(monthly_rows)
     with st.expander("View monthly forecast quantities by part and plant", expanded=True):
         st.dataframe(monthly_df, use_container_width=True, hide_index=True)
+    st.markdown("### 5. Selected-part monthly visual")
+    part_options = {f"{r['part_no']} | {r['plant']} | {r['customer']}": r["key"] for r in records}
+    selected_part_label = st.selectbox("Choose a part to view its historical and forecast trend", list(part_options.keys()))
+    selected_part_key = part_options[selected_part_label]
+    selected_rec_ui = next(r for r in records if r["key"] == selected_part_key)
+    first_forecast_month_ui = min(dt for fy in target_fys for dt in cache[(selected_part_key, fy)]["target_months"])
+    hist_plot = [{"Month":dt, "Type":"Historical / Source", "Quantity":float(v)} for dt,v in sorted(selected_rec_ui["series"].items()) if dt < first_forecast_month_ui and np.isfinite(v)]
+    fc_plot = []
+    selected_edit_row = edited[edited["Part Key"] == selected_part_key].iloc[0]
+    for yi, fy in enumerate(target_fys):
+        selected_info = cache[(selected_part_key, fy)]
+        selected_method = str(selected_edit_row["Selected Method"])
+        selected_pred, _ = ensure_forecast(selected_info, selected_method, candidates)
+        selected_change = float(selected_edit_row["FY1 Change %"] if yi == 0 else selected_edit_row["FY2 Change %"])
+        selected_factors = [variable_multiplier(fy, dt, assumptions) for dt in selected_info["target_months"]]
+        selected_adjusted = np.maximum(0, np.asarray(selected_pred) * (1 + selected_change/100.0) * np.asarray(selected_factors))
+        fc_plot.extend({"Month":dt, "Type":"Forecast", "Quantity":float(qty)} for dt,qty in zip(selected_info["target_months"], selected_adjusted))
+    plot_df = pd.DataFrame(hist_plot + fc_plot).sort_values("Month")
+    if not plot_df.empty:
+        st.line_chart(plot_df.pivot_table(index="Month", columns="Type", values="Quantity", aggfunc="first"))
+    with st.expander("Technical terms, model names, patterns and accuracy metrics — meanings", expanded=True):
+        st.dataframe(build_glossary_df(), use_container_width=True, hide_index=True)
+        st.caption("WAPE: lower is better. RMSE: lower is better and is measured in quantity units. Bias: positive means over-forecast; negative means under-forecast. Validation uses a chronological holdout.")
     with st.expander("Model comparison details by part and forecast year"):
         comparison_preview = []
         for rec in records:
@@ -909,9 +1110,9 @@ def main():
                     comparison_preview.append({"Forecast FY":fy,"Plant":rec["plant"],"Customer":rec["customer"],"Part No.":rec["part_no"],**mr.to_dict()})
         st.dataframe(pd.DataFrame(comparison_preview), use_container_width=True, hide_index=True)
 
-    st.markdown("### 5. Export original workbook with forecast sheets")
+    st.markdown("### 6. Export original workbook with forecast sheets")
     with st.spinner("Creating a formatted Excel copy and adding forecast-year plant sheets..."):
-        output, summary_df, comparison_df = build_output_workbook(raw, uploaded.name, target_fys, records, month_map, cache, edited, candidates, global_method, assumptions)
+        output, summary_df, comparison_df = build_output_workbook(raw, uploaded.name, target_fys, records, month_map, cache, edited, candidates, global_method, assumptions, selected_part_key)
     st.success("Forecast workbook is ready. Your original worksheets are retained; new forecast copies are added for each selected year and plant.")
     st.download_button(
         "Download completed manufacturing forecast workbook",
@@ -921,7 +1122,7 @@ def main():
         type="primary",
         use_container_width=True
     )
-    st.caption("Excel output includes: original tabs unchanged; copied forecast plant tabs with adjusted monthly quantities; Forecast Summary; Model Comparison; Forecast Controls; Forecast Assumptions. All enabled external variables, selected months, percentage effects and part-level changes are documented.")
+    st.caption("Excel output includes: original tabs unchanged; copied forecast plant tabs with adjusted monthly quantities; Forecast Summary; Model Comparison; Forecast Controls; Forecast Assumptions, Part-wise Monthly Forecast (historical months plus selected 24 forecast months), Selected Part Trend chart, and Forecast Glossary. The final two columns in the part-wise sheet are Variables Applied and Model Used.")
 
 if __name__ == "__main__":
     main()
