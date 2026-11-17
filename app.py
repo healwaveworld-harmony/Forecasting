@@ -860,9 +860,11 @@ def build_output_workbook(raw_bytes, filename, target_fys, records, month_map, c
     except Exception:
         pass
     # Put the consolidated part-wise monthly sheet at the end for quick access.
-    if "Part-wise Monthly Forecast" in wb.sheetnames:
-        wb._sheets.remove(wb["Part-wise Monthly Forecast"])
-        wb._sheets.append(wb["Part-wise Monthly Forecast"])
+    # Use the worksheet object created above instead of looking it up by title;
+    # this avoids a KeyError if a workbook title is altered or normalised.
+    if partwise_ws in wb._sheets:
+        wb._sheets.remove(partwise_ws)
+        wb._sheets.append(partwise_ws)
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
