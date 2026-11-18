@@ -1,4 +1,3 @@
-
 import io
 import re
 import math
@@ -996,9 +995,9 @@ def main():
         st.stop()
 
     st.markdown("### 3. Part-level forecast controls")
-    st.caption("Select a method for each part and enter a percentage change for each forecast year. Use 1, 5, -5 etc. for +1%, +5% or -5%. Changes are applied to every month of that part's forecast year.")
+    st.caption("Select a model and enter a part-level change for each forecast year. Last 3M Mean is the average monthly quantity across the latest 3 source months; Last 12M Mean is the average monthly quantity across the latest 12 source months. These are reference indicators, not the forecast. Changes are applied to every forecast month.")
     visible_cols = ["Plant","Customer","Part No.","Model","Vehicle","SAP Code","Product","Segment","Weight kg/pc",
-                    "Sales Price INR/pc","Price INR/pc","Last Month Qty","Last 3M Mean","Last 12M Mean",
+                    "Sales Price INR/pc","Price INR/pc","Last 3M Mean","Last 12M Mean",
                     "Demand Pattern","Selected Method","FY1 Change %","FY2 Change %",f"{fy1} Base Qty",f"{fy2} Base Qty"]
     edited = st.data_editor(
         ui_df[visible_cols],
@@ -1010,7 +1009,6 @@ def main():
                 help="Choose the forecasting approach for this part. Full model meanings are shown above in the model guide."),
             "FY1 Change %":st.column_config.NumberColumn(f"{fy1} Change %",min_value=-100.0,max_value=500.0,step=1.0,format="%.1f"),
             "FY2 Change %":st.column_config.NumberColumn(f"{fy2} Change %",min_value=-100.0,max_value=500.0,step=1.0,format="%.1f"),
-            "Last Month Qty":st.column_config.NumberColumn(format="%.2f",disabled=True),
             "Last 3M Mean":st.column_config.NumberColumn(format="%.2f",disabled=True),
             "Last 12M Mean":st.column_config.NumberColumn(format="%.2f",disabled=True),
             f"{fy1} Base Qty":st.column_config.NumberColumn(format="%.2f",disabled=True),
@@ -1022,8 +1020,9 @@ def main():
     edited = edited.copy()
     edited["Part Key"] = ui_df.loc[edited.index, "Part Key"].values
 
-    # Live adjusted summary reflects each part's chosen method and year-specific percentage.
+    # Live adjusted summary: annual forecast versus comparable source baseline.
     live_rows = []
+    monthly_rows = []
     for _, row in edited.iterrows():
         key = row["Part Key"]
         rec = next(r for r in records if r["key"] == key)
@@ -1037,47 +1036,105 @@ def main():
             avg_variable_effect = float(np.mean(month_factors) - 1.0) * 100.0
             metric = metric_for_method(info, method_applied, candidates)
             price = rec["price_inr_pc"] if np.isfinite(rec["price_inr_pc"]) else rec["sales_price"]
+
+            baseline = np.asarray(info["target_plan"], dtype=float)
+            valid = np.isfinite(baseline)
+            baseline_total = float(np.sum(baseline[valid])) if valid.any() else np.nan
+            forecast_comparable = float(np.sum(adjusted[valid])) if valid.any() else np.nan
+            variance_qty = forecast_comparable - baseline_total if valid.any() else np.nan
+            variance_pct = variance_qty / baseline_total * 100.0 if valid.any() and abs(baseline_total) > 1e-12 else np.nan
+            if not valid.any():
+                variance_text = "No comparable source values are available for these forecast months."
+            elif variance_pct > 0.05:
+                variance_text = f"Forecast is {variance_pct:.1f}% ({variance_qty:,.0f} units) above the uploaded {source_basis.lower()} baseline."
+            elif variance_pct < -0.05:
+                variance_text = f"Forecast is {abs(variance_pct):.1f}% ({abs(variance_qty):,.0f} units) below the uploaded {source_basis.lower()} baseline."
+            elif not np.isfinite(variance_pct):
+                variance_text = f"Comparable {source_basis.lower()} total is zero; percentage variance is not meaningful."
+            else:
+                variance_text = f"Forecast is broadly in line with the uploaded {source_basis.lower()} baseline."
+
+            driver_text = (
+                f"Model: {method_applied}; part adjustment: {change:+.1f}%; "
+                f"average enabled business assumptions: {avg_variable_effect:+.1f}%."
+            )
+            variance_text = variance_text + " " + driver_text
+
             live_rows.append({
                 "Forecast FY":fy,"Plant":rec["plant"],"Customer":rec["customer"],"Part No.":rec["part_no"],
-                "Product":rec["product"],"Selected Method":method_applied,"Last Month Qty":info["last"],
-                "Last 3M Mean":info["mean3"],"Last 12M Mean":info["mean12"],"WAPE %":metric.get("WAPE %",np.nan),
-                "RMSE":metric.get("RMSE",np.nan),"Bias %":metric.get("Bias %",np.nan),
-                "Part Change %":change,"Average External Variables Effect %":avg_variable_effect,
-                "Base Annual Qty":float(np.sum(pred)),"Adjusted Annual Qty":float(np.sum(adjusted)),
-                "Price INR/pc":price,"Forecast Business Value INR":float(np.sum(adjusted))*price if np.isfinite(price) else np.nan,
+                "Product":rec["product"],"Forecast Method":method_applied,
+                "Last 3M Mean (monthly)":info["mean3"],"Last 12M Mean (monthly)":info["mean12"],
+                f"{source_basis} Baseline Qty":baseline_total,
+                "Forecast Qty (annual)":float(np.sum(adjusted)),
+                "Variance Qty":variance_qty,"Variance %":variance_pct,"Variance explanation":variance_text,
+                "WAPE % (backtest)":metric.get("WAPE %",np.nan),
+                "RMSE (units)":metric.get("RMSE",np.nan),"Bias % (backtest)":metric.get("Bias %",np.nan),
+                "Part Change %":change,"External Variables Effect % (avg)":avg_variable_effect,
+                "Price INR/pc":price,
+                "Forecast Business Value INR":float(np.sum(adjusted))*price if np.isfinite(price) else np.nan,
             })
-    live_df = pd.DataFrame(live_rows)
-    total_forecast = live_df.groupby("Forecast FY")["Adjusted Annual Qty"].sum()
-    m1,m2,m3,m4 = st.columns(4)
-    m1.metric(f"{fy1} adjusted volume", f"{total_forecast.get(fy1,0):,.0f}")
-    m2.metric(f"{fy2} adjusted volume", f"{total_forecast.get(fy2,0):,.0f}")
-    m3.metric("Part / plant combinations", f"{len(ui_df):,}")
-    m4.metric("Forecast methods", f"{len(set(edited['Selected Method']))}")
-
-    st.markdown("### 4. Forecast preview")
-    st.caption("Annual part-level totals and monthly quantities are both available here.")
-    st.dataframe(live_df, use_container_width=True, hide_index=True)
-    monthly_rows = []
-    for _, row in edited.iterrows():
-        key = row["Part Key"]
-        rec = next(r for r in records if r["key"] == key)
-        selected_method = str(row["Selected Method"])
-        for yi, fy in enumerate(target_fys):
-            info = cache[(key, fy)]
-            pred, method_applied = ensure_forecast(info, selected_method, candidates)
-            change = float(row["FY1 Change %"] if yi == 0 else row["FY2 Change %"])
-            month_factors = np.array([variable_multiplier(fy, dt, assumptions) for dt in info["target_months"]], dtype=float)
-            adjusted = np.maximum(0, np.asarray(pred) * (1 + change/100.0) * month_factors)
-            for dt, base_qty, adj_qty, var_factor in zip(info["target_months"], pred, adjusted, month_factors):
+            for dt, base_qty, adj_qty, var_factor, baseline_qty in zip(info["target_months"], pred, adjusted, month_factors, baseline):
+                has_baseline = np.isfinite(baseline_qty)
+                month_var_qty = float(adj_qty - baseline_qty) if has_baseline else np.nan
+                month_var_pct = month_var_qty / float(baseline_qty) * 100.0 if has_baseline and abs(float(baseline_qty)) > 1e-12 else np.nan
                 monthly_rows.append({
-                    "Forecast FY":fy,"Month":dt,"Plant":rec["plant"],"Customer":rec["customer"],
-                    "Part No.":rec["part_no"],"Product":rec["product"],"Forecast Method":method_applied,
+                    "Forecast FY":fy,"Month":dt.strftime("%b-%Y"),"Plant":rec["plant"],
+                    "Customer":rec["customer"],"Part No.":rec["part_no"],"Product":rec["product"],
+                    "Forecast Method":method_applied,
+                    f"{source_basis} Baseline Qty":float(baseline_qty) if has_baseline else np.nan,
+                    "Forecast Qty":float(adj_qty),
+                    "Variance Qty":month_var_qty,"Variance %":month_var_pct,
                     "Part Change %":change,"External Variables Effect %":float((var_factor-1)*100),
-                    "Base Forecast Qty":float(base_qty),"Adjusted Forecast Qty":float(adj_qty)
+                    "Base Model Qty":float(base_qty),
                 })
+
+    live_df = pd.DataFrame(live_rows)
+    total_forecast = live_df.groupby("Forecast FY")["Forecast Qty (annual)"].sum()
+    m1,m2,m3,m4 = st.columns(4)
+    m1.metric(f"{fy1} forecast volume", f"{total_forecast.get(fy1,0):,.0f}")
+    m2.metric(f"{fy2} forecast volume", f"{total_forecast.get(fy2,0):,.0f}")
+    m3.metric("Part / plant combinations", f"{len(ui_df):,}")
+    m4.metric("Forecast methods used", f"{len(set(edited['Selected Method']))}")
+
+    st.markdown("### 4. Forecast preview — annual variance and monthly quantities")
+    st.caption("Forecast Qty is the model's 12-month total after your part-level change and enabled business assumptions. The month-by-month quantities are shown below.")
+    st.markdown("**How to read the variance**")
+    st.write(
+        f"Variance Qty = Forecast Qty − {source_basis} Baseline Qty. "
+        f"Variance % = Variance Qty ÷ {source_basis} Baseline Qty × 100. "
+        "Positive means the forecast is higher; negative means it is lower. "
+        "The comparison uses only matching forecast months where source values exist."
+    )
+    st.markdown("**Forecast adjustment formula**")
+    st.code(
+        "Adjusted monthly forecast = Base model forecast × (1 + Part Change % / 100) "
+        "× applicable external-variable multipliers\n"
+        "Annual forecast = Sum of the 12 adjusted monthly forecasts",
+        language="text"
+    )
+    st.markdown("**Backtest metric formulas — historical validation, not future variance**")
+    st.write(
+        "WAPE % = Σ|Baseline − Backtest forecast| ÷ Σ|Baseline| × 100  •  "
+        "Bias % = Σ(Backtest forecast − Baseline) ÷ Σ|Baseline| × 100  •  "
+        "RMSE = √[Mean((Baseline − Backtest forecast)²)]."
+    )
+    st.caption(
+        "WAPE shows the size of past holdout errors (lower is better). "
+        "Bias shows direction: positive = over-forecast; negative = under-forecast. "
+        "RMSE is the error scale in quantity units and penalises large misses. "
+        "These are historical backtest measures, not a guarantee of future accuracy."
+    )
+    if source_basis == "Plan":
+        st.warning("Source note: the plant-level monthly series in this workbook is labelled Plan, not Actual. Variance is therefore against the uploaded Plan baseline, not actual sales. Part-level actuals are needed for a true actual-versus-forecast comparison.")
+    st.dataframe(live_df, use_container_width=True, hide_index=True)
+
     monthly_df = pd.DataFrame(monthly_rows)
-    with st.expander("View monthly forecast quantities by part and plant", expanded=True):
-        st.dataframe(monthly_df, use_container_width=True, hide_index=True)
+    st.markdown("**Monthly forecast quantities and variance**")
+    st.caption("Each row is one part, plant and calendar month. Forecast Qty is the calculated monthly output, not an annual figure.")
+    part_filter_options = ["All parts"] + sorted(monthly_df["Part No."].dropna().astype(str).unique().tolist())
+    selected_monthly_part = st.selectbox("Filter monthly detail by part number", part_filter_options, key="monthly_part_filter")
+    monthly_view = monthly_df if selected_monthly_part == "All parts" else monthly_df[monthly_df["Part No."].astype(str) == selected_monthly_part]
+    st.dataframe(monthly_view, use_container_width=True, hide_index=True)
     st.markdown("### 5. Selected-part monthly visual")
     part_options = {f"{r['part_no']} | {r['plant']} | {r['customer']}": r["key"] for r in records}
     selected_part_label = st.selectbox("Choose a part to view its historical and forecast trend", list(part_options.keys()))
