@@ -1,3 +1,4 @@
+
 import io
 import re
 import math
@@ -12,7 +13,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 from openpyxl.utils import get_column_letter
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.4.0"
 MONTH_START_COL = 36   # AJ
 MONTH_END_COL = 95     # CQ, inclusive
 MONTH_HEADER_ROW = 6
@@ -600,7 +601,48 @@ def build_glossary_df():
     return pd.DataFrame(rows)
 
 
-def build_output_workbook(raw_bytes, filename, target_fys, records, month_map, cache, edited, candidates, global_method, assumptions, selected_part_key=None):
+def dataframe_to_xlsx(df, sheet_name):
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def apply_part_month_adjustments(base_qty, part_key, fy, month_dt, order_df, campaign_df):
+    """Apply part-specific confirmed-order and campaign adjustments for one month."""
+    qty = float(base_qty)
+    remarks = []
+    month_name = MONTH_NAMES[month_dt.month - 1]
+    if order_df is not None and not order_df.empty:
+        rows = order_df[(order_df["Part Key"].astype(str) == str(part_key)) &
+                        (order_df["Forecast FY"].astype(str) == str(fy)) &
+                        (order_df["Month"].astype(str) == month_name)]
+        for _, r in rows.iterrows():
+            value = float(r.get("Adjustment", 0) or 0)
+            kind = str(r.get("Adjustment Type", "Units"))
+            if abs(value) < 1e-12:
+                continue
+            if kind == "Percent":
+                qty *= max(0.0, 1.0 + value / 100.0)
+                remarks.append(f"Confirmed orders {value:+g}%")
+            else:
+                qty = max(0.0, qty + value)
+                remarks.append(f"Confirmed orders {value:+g} units")
+    if campaign_df is not None and not campaign_df.empty:
+        rows = campaign_df[(campaign_df["Part Key"].astype(str) == str(part_key)) &
+                           (campaign_df["Forecast FY"].astype(str) == str(fy)) &
+                           (campaign_df["Month"].astype(str) == month_name)]
+        for _, r in rows.iterrows():
+            value = float(r.get("Campaign Change %", 0) or 0)
+            if abs(value) < 1e-12:
+                continue
+            qty *= max(0.0, 1.0 + value / 100.0)
+            remarks.append(f"Campaign {value:+g}%")
+    return max(0.0, qty), "; ".join(remarks)
+
+
+def build_output_workbook(raw_bytes, filename, target_fys, records, month_map, cache, edited, candidates, global_method, assumptions, order_df=None, campaign_df=None, selected_part_key=None):
     keep_vba = filename.lower().endswith(".xlsm")
     wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=False, keep_vba=keep_vba)
     # Data-only workbook supplies cached formula results for calculations.
@@ -625,6 +667,11 @@ def build_output_workbook(raw_bytes, filename, target_fys, records, month_map, c
             change = changes[yi]
             month_factors = np.array([variable_multiplier(fy, dt, assumptions) for dt in info["target_months"]], dtype=float)
             adjusted = np.maximum(0, np.asarray(pred, dtype=float) * (1 + change/100.0) * month_factors)
+            adjustment_remarks = []
+            for mi, dt in enumerate(info["target_months"]):
+                adjusted[mi], remark = apply_part_month_adjustments(adjusted[mi], rec["key"], fy, dt, order_df, campaign_df)
+                if remark:
+                    adjustment_remarks.append(f"{dt.strftime('%b-%Y')}: {remark}")
             forecast_values[(rec["key"], fy)] = adjusted
             avg_variable_effect = float(np.mean(month_factors) - 1.0) * 100.0
             metrics = info["metrics"]
@@ -645,7 +692,7 @@ def build_output_workbook(raw_bytes, filename, target_fys, records, month_map, c
                 "Forecast Bias %":metric_row.get("Bias %",np.nan),"Part Change %":change,
                 "Average External Variables Effect %":avg_variable_effect,
                 "Base Annual Forecast Qty":annual_base,"Adjusted Annual Forecast Qty":annual_adjusted,
-                "Forecast Business Value INR":business_value,"Data Basis":"Existing monthly plan baseline; not actual demand"
+                "Forecast Business Value INR":business_value,"Part-specific order / campaign remarks":"; ".join(adjustment_remarks) or "None","Data Basis":"Existing monthly plan baseline; not actual demand"
             })
             for _, mrow in metrics.iterrows():
                 comparison_rows.append({
@@ -696,6 +743,8 @@ def build_output_workbook(raw_bytes, filename, target_fys, records, month_map, c
                 pred, method_applied = ensure_forecast(info, selected_method, candidates)
                 month_factors = np.array([variable_multiplier(fy, dt, assumptions) for dt in info["target_months"]], dtype=float)
                 adjusted = np.maximum(0, np.asarray(pred, dtype=float) * (1 + change/100.0) * month_factors)
+                for mi, dt in enumerate(info["target_months"]):
+                    adjusted[mi], _ = apply_part_month_adjustments(adjusted[mi], rec["key"], fy, dt, order_df, campaign_df)
                 forecast_values[(rec["key"], fy)] = adjusted
                 # Replace only this year's monthly cells on the cloned worksheet.
                 for (col, dt), qty in zip(year_months, adjusted):
@@ -768,6 +817,10 @@ def build_output_workbook(raw_bytes, filename, target_fys, records, month_map, c
                     variable_labels.append(f"{fy} {title}: {float(cfg.get(key + '_pct',0.0)):+g}%{month_text}")
             if abs(change) > 1e-12:
                 variable_labels.append(f"{fy} Part change: {change:+g}%")
+            for dt in info["target_months"]:
+                _, remark = apply_part_month_adjustments(0.0, rec["key"], fy, dt, order_df, campaign_df)
+                if remark:
+                    variable_labels.append(f"{fy} {dt.strftime('%b')}: {remark}")
         # Keep these as the final columns as requested.
         part_row["Variables Applied"] = "; ".join(dict.fromkeys(variable_labels)) if variable_labels else "None"
         part_row["Model Used"] = " / ".join(applied_models) if applied_models else selected_method
@@ -852,6 +905,8 @@ def build_output_workbook(raw_bytes, filename, target_fys, records, month_map, c
     control_df = pd.DataFrame(controls, columns=["Setting","Value"])
     add_table_sheet(wb, "Forecast Controls", control_df)
     add_table_sheet(wb, "Forecast Assumptions", assumptions_to_rows(assumptions, target_fys))
+    add_table_sheet(wb, "Customer Order Adjustments", order_df if order_df is not None else pd.DataFrame(columns=["Part Key","Part No.","Forecast FY","Month","Adjustment Type","Adjustment","Remarks"]))
+    add_table_sheet(wb, "Part Campaign Adjustments", campaign_df if campaign_df is not None else pd.DataFrame(columns=["Part Key","Part No.","Forecast FY","Month","Campaign Change %","Remarks"]))
     try:
         wb.calculation.fullCalcOnLoad = True
         wb.calculation.forceFullCalc = True
@@ -956,6 +1011,58 @@ def main():
     else:
         st.dataframe(active_assumptions, use_container_width=True, hide_index=True)
 
+    # Part-specific customer order and campaign inputs. Each row applies to one part and month.
+    st.markdown("### 2A. Part-specific confirmed orders and campaigns")
+    st.caption("Add one row per part and month. These inputs are separate from the general business assumptions and are applied only to the selected part(s).")
+    part_labels = {f"{r['part_no']} | {r['plant']} | {r['customer']} [{r['key']}]": r["key"] for r in records}
+    part_label_by_key = {v:k for k,v in part_labels.items()}
+    order_template = pd.DataFrame([{"Part Key":"", "Part No.":"", "Forecast FY":fy1, "Month":"Jan", "Adjustment Type":"Units", "Adjustment":0.0, "Remarks":""}])
+    with st.expander("Customer nominations / confirmed orders — select multiple parts", expanded=False):
+        st.caption("Positive units add confirmed quantities; negative units reduce them. Percent adjustments increase or reduce the model-derived quantity for that selected month.")
+        order_parts = st.multiselect("Apply confirmed-order adjustment to parts", list(part_labels.keys()), key="order_parts_multi")
+        order_mode = st.radio("Order adjustment type", ["Units", "Percent"], horizontal=True, key="order_mode")
+        order_month = st.selectbox("Month", MONTH_NAMES, key="order_month")
+        order_fy = st.selectbox("Forecast year", target_fys, key="order_fy")
+        order_value = st.number_input("Monthly order adjustment (+ / −)", value=0.0, step=1.0, key="order_value")
+        order_note = st.text_input("Order reference / note (optional)", key="order_note")
+        if st.button("Add order adjustment to selected parts", key="add_order_rows"):
+            rows = st.session_state.get("customer_order_rows", [])
+            for label in order_parts:
+                key = part_labels[label]
+                recx = next(r for r in records if r["key"] == key)
+                rows.append({"Part Key":key,"Part No.":recx["part_no"],"Forecast FY":order_fy,"Month":order_month,"Adjustment Type":order_mode,"Adjustment":float(order_value),"Remarks":order_note})
+            st.session_state["customer_order_rows"] = rows
+        order_rows = st.session_state.get("customer_order_rows", [])
+        if order_rows:
+            st.dataframe(pd.DataFrame(order_rows).drop(columns=["Part Key"]), use_container_width=True, hide_index=True)
+            st.download_button("Download customer-order input sheet (Excel)", dataframe_to_xlsx(pd.DataFrame(order_rows).drop(columns=["Part Key"]), "Customer Orders"), "customer_order_adjustments.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="download_order_xlsx")
+            if st.button("Clear customer-order adjustments", key="clear_order_rows"):
+                st.session_state["customer_order_rows"] = []
+                st.rerun()
+    with st.expander("Promotions / customer campaigns — select part and months", expanded=False):
+        st.caption("Campaign changes are percentage adjustments applied only to the chosen part and month(s).")
+        campaign_part = st.selectbox("Part", list(part_labels.keys()), key="campaign_part")
+        campaign_fy = st.selectbox("Campaign forecast year", target_fys, key="campaign_fy")
+        campaign_months = st.multiselect("Campaign months", MONTH_NAMES, key="campaign_months")
+        campaign_pct = st.number_input("Campaign demand change % (+ / −)", value=0.0, step=1.0, key="campaign_pct")
+        campaign_note = st.text_input("Campaign / promotion note", key="campaign_note")
+        if st.button("Add campaign to selected months", key="add_campaign_rows"):
+            rows = st.session_state.get("campaign_rows", [])
+            key = part_labels[campaign_part]
+            recx = next(r for r in records if r["key"] == key)
+            for mon in campaign_months:
+                rows.append({"Part Key":key,"Part No.":recx["part_no"],"Forecast FY":campaign_fy,"Month":mon,"Campaign Change %":float(campaign_pct),"Remarks":campaign_note})
+            st.session_state["campaign_rows"] = rows
+        campaign_rows = st.session_state.get("campaign_rows", [])
+        if campaign_rows:
+            st.dataframe(pd.DataFrame(campaign_rows).drop(columns=["Part Key"]), use_container_width=True, hide_index=True)
+            st.download_button("Download campaign input sheet (Excel)", dataframe_to_xlsx(pd.DataFrame(campaign_rows).drop(columns=["Part Key"]), "Campaigns"), "campaign_adjustments.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="download_campaign_xlsx")
+            if st.button("Clear campaign adjustments", key="clear_campaign_rows"):
+                st.session_state["campaign_rows"] = []
+                st.rerun()
+    order_df = pd.DataFrame(st.session_state.get("customer_order_rows", []), columns=["Part Key","Part No.","Forecast FY","Month","Adjustment Type","Adjustment","Remarks"])
+    campaign_df = pd.DataFrame(st.session_state.get("campaign_rows", []), columns=["Part Key","Part No.","Forecast FY","Month","Campaign Change %","Remarks"])
+
     # The workbook's plant sheets mark the monthly data as Plan, not actuals.
     source_basis = "Plan" if any("Plan" in str(x) for vals in basis_by_year.values() for x in vals) else "Unspecified / mixed"
     if source_basis == "Plan":
@@ -1033,6 +1140,11 @@ def main():
             change = float(row["FY1 Change %"] if yi == 0 else row["FY2 Change %"])
             month_factors = np.array([variable_multiplier(fy, dt, assumptions) for dt in info["target_months"]], dtype=float)
             adjusted = np.maximum(0, np.asarray(pred) * (1 + change/100.0) * month_factors)
+            part_remarks = []
+            for mi, dt in enumerate(info["target_months"]):
+                adjusted[mi], remark = apply_part_month_adjustments(adjusted[mi], key, fy, dt, order_df, campaign_df)
+                if remark:
+                    part_remarks.append(f"{dt.strftime('%b')}: {remark}")
             avg_variable_effect = float(np.mean(month_factors) - 1.0) * 100.0
             metric = metric_for_method(info, method_applied, candidates)
             price = rec["price_inr_pc"] if np.isfinite(rec["price_inr_pc"]) else rec["sales_price"]
@@ -1054,9 +1166,11 @@ def main():
             else:
                 variance_text = f"Forecast is broadly in line with the uploaded {source_basis.lower()} baseline."
 
+            order_campaign_text = "; ".join(part_remarks) if part_remarks else "no part-specific order or campaign inputs"
             driver_text = (
                 f"Model: {method_applied}; part adjustment: {change:+.1f}%; "
-                f"average enabled business assumptions: {avg_variable_effect:+.1f}%."
+                f"average enabled business assumptions: {avg_variable_effect:+.1f}%; "
+                f"part-specific inputs: {order_campaign_text}."
             )
             variance_text = variance_text + " " + driver_text
 
@@ -1070,6 +1184,7 @@ def main():
                 "WAPE % (backtest)":metric.get("WAPE %",np.nan),
                 "RMSE (units)":metric.get("RMSE",np.nan),"Bias % (backtest)":metric.get("Bias %",np.nan),
                 "Part Change %":change,"External Variables Effect % (avg)":avg_variable_effect,
+                "Part-specific order / campaign remarks":"; ".join(part_remarks) or "None",
                 "Price INR/pc":price,
                 "Forecast Business Value INR":float(np.sum(adjusted))*price if np.isfinite(price) else np.nan,
             })
@@ -1086,6 +1201,7 @@ def main():
                     "Variance Qty":month_var_qty,"Variance %":month_var_pct,
                     "Part Change %":change,"External Variables Effect %":float((var_factor-1)*100),
                     "Base Model Qty":float(base_qty),
+                    "Order / campaign remarks":apply_part_month_adjustments(base_qty * (1 + change/100.0) * var_factor, key, fy, dt, order_df, campaign_df)[1] or "None",
                 })
 
     live_df = pd.DataFrame(live_rows)
@@ -1141,7 +1257,10 @@ def main():
     selected_part_key = part_options[selected_part_label]
     selected_rec_ui = next(r for r in records if r["key"] == selected_part_key)
     first_forecast_month_ui = min(dt for fy in target_fys for dt in cache[(selected_part_key, fy)]["target_months"])
-    hist_plot = [{"Month":dt, "Type":"Historical / Source", "Quantity":float(v)} for dt,v in sorted(selected_rec_ui["series"].items()) if dt < first_forecast_month_ui and np.isfinite(v)]
+    hist_items = [(dt, v) for dt, v in sorted(selected_rec_ui["series"].items()) if dt < first_forecast_month_ui and np.isfinite(v)]
+    # Keep the graph responsive for long histories while preserving the most recent 36 monthly observations.
+    hist_items = hist_items[-36:]
+    hist_plot = [{"Month":dt, "Type":"Historical / Source", "Quantity":float(v)} for dt,v in hist_items]
     fc_plot = []
     selected_edit_row = edited[edited["Part Key"] == selected_part_key].iloc[0]
     for yi, fy in enumerate(target_fys):
@@ -1151,6 +1270,8 @@ def main():
         selected_change = float(selected_edit_row["FY1 Change %"] if yi == 0 else selected_edit_row["FY2 Change %"])
         selected_factors = [variable_multiplier(fy, dt, assumptions) for dt in selected_info["target_months"]]
         selected_adjusted = np.maximum(0, np.asarray(selected_pred) * (1 + selected_change/100.0) * np.asarray(selected_factors))
+        for mi, dt in enumerate(selected_info["target_months"]):
+            selected_adjusted[mi], _ = apply_part_month_adjustments(selected_adjusted[mi], selected_part_key, fy, dt, order_df, campaign_df)
         fc_plot.extend({"Month":dt, "Type":"Forecast", "Quantity":float(qty)} for dt,qty in zip(selected_info["target_months"], selected_adjusted))
     plot_df = pd.DataFrame(hist_plot + fc_plot).sort_values("Month")
     if not plot_df.empty:
@@ -1171,7 +1292,7 @@ def main():
 
     st.markdown("### 6. Export original workbook with forecast sheets")
     with st.spinner("Creating a formatted Excel copy and adding forecast-year plant sheets..."):
-        output, summary_df, comparison_df = build_output_workbook(raw, uploaded.name, target_fys, records, month_map, cache, edited, candidates, global_method, assumptions, selected_part_key)
+        output, summary_df, comparison_df = build_output_workbook(raw, uploaded.name, target_fys, records, month_map, cache, edited, candidates, global_method, assumptions, order_df, campaign_df, selected_part_key)
     st.success("Forecast workbook is ready. Your original worksheets are retained; new forecast copies are added for each selected year and plant.")
     st.download_button(
         "Download completed manufacturing forecast workbook",
